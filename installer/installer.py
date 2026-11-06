@@ -23,6 +23,8 @@ import sys
 import json
 import re
 import shutil
+import zipfile
+import io
 import urllib.request
 import urllib.error
 import subprocess
@@ -32,6 +34,23 @@ from pathlib import Path
 REPO_RAW_BASE = "https://raw.githubusercontent.com/CB-1829/PYapps-INSTALL-SOURCE/main"
 GITHUB_IO_BASE = "https://cb-1829.github.io/PYapps-INSTALL-SOURCE"
 OFFICIAL_KEYS_BASE = GITHUB_IO_BASE + "/installer/officialkeys/mainkeys"
+GITHUB_API_TREE = "https://api.github.com/repos/CB-1829/PYapps-INSTALL-SOURCE/git/trees/main?recursive=1"
+GITHUB_API_CONTENTS = "https://api.github.com/repos/CB-1829/PYapps-INSTALL-SOURCE/contents/apps"
+
+# Static catalog fallback in case GitHub API rate limits
+KNOWN_APPS_CATALOG = {
+    "gemswarm": {
+        "folder": "Gemini-Cursor-Swarm",
+        "zip": "apps/Gemini-Cursor-Swarm/gemini-cursor-swarm---desktop-multi-agent-program.zip",
+        "name": "Gemini Cursor Swarm",
+    },
+    "testapp": {
+        "folder": "testapp",
+        "zip": None,
+        "files": ["app.py", "run.py", "info.app.json"],
+        "name": "Test Application",
+    },
+}
 
 # Determine target installation paths
 def get_apps_root_dir() -> Path:
@@ -82,7 +101,7 @@ def fetch_url_text(url: str, timeout: int = 10) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-def fetch_url_bytes(url: str, timeout: int = 15) -> tuple[bool, bytes]:
+def fetch_url_bytes(url: str, timeout: int = 25) -> tuple[bool, bytes]:
     """Fetch binary content from a given URL."""
     try:
         req = urllib.request.Request(
@@ -95,6 +114,111 @@ def fetch_url_bytes(url: str, timeout: int = 15) -> tuple[bool, bytes]:
     except Exception as e:
         return False, b""
 
+def fetch_repo_tree() -> dict[str, dict]:
+    """
+    Queries GitHub API or fallbacks to find all available apps and their .zip packages.
+    Returns: { folder_name: { 'folder': str, 'zip': str | None, 'files': list[str] } }
+    """
+    apps: dict[str, dict] = {}
+    
+    # Tier 1: Recursive Git Tree
+    try:
+        req = urllib.request.Request(GITHUB_API_TREE, headers={"User-Agent": "PYapps-Installer/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            tree_data = json.loads(resp.read().decode("utf-8")).get("tree", [])
+            for item in tree_data:
+                path = item.get("path", "")
+                if not path.startswith("apps/"):
+                    continue
+                parts = path.split("/")
+                if len(parts) >= 2:
+                    folder = parts[1]
+                    if folder not in apps:
+                        apps[folder] = {"folder": folder, "files": [], "zip": None}
+                    if len(parts) > 2:
+                        subfile = parts[2]
+                        apps[folder]["files"].append(subfile)
+                        if subfile.lower().endswith(".zip"):
+                            apps[folder]["zip"] = path
+            if apps:
+                return apps
+    except Exception:
+        pass
+
+    # Tier 2: GitHub Contents API
+    try:
+        req = urllib.request.Request(GITHUB_API_CONTENTS, headers={"User-Agent": "PYapps-Installer/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            contents = json.loads(resp.read().decode("utf-8"))
+            for item in contents:
+                name = item.get("name", "")
+                if item.get("type") == "dir":
+                    apps[name] = {"folder": name, "files": [], "zip": None}
+                    # Probe folder for zip
+                    try:
+                        sub_req = urllib.request.Request(GITHUB_API_CONTENTS + "/" + name, headers={"User-Agent": "PYapps-Installer/1.0"})
+                        with urllib.request.urlopen(sub_req, timeout=8) as sub_resp:
+                            sub_files = json.loads(sub_resp.read().decode("utf-8"))
+                            for sf in sub_files:
+                                sf_name = sf.get("name", "")
+                                apps[name]["files"].append(sf_name)
+                                if sf_name.lower().endswith(".zip"):
+                                    apps[name]["zip"] = "apps/" + name + "/" + sf_name
+                    except Exception:
+                        pass
+            if apps:
+                return apps
+    except Exception:
+        pass
+
+    # Tier 3: Known apps catalog fallback
+    for k, v in KNOWN_APPS_CATALOG.items():
+        apps[v["folder"]] = {"folder": v["folder"], "files": v.get("files", []), "zip": v.get("zip")}
+    return apps
+
+def resolve_app_package(install_name: str) -> tuple[str | None, str | None, list[str]]:
+    """
+    Resolves install_name (e.g. 'gemswarm') to the actual repository folder,
+    zip package path, and/or loose files.
+    """
+    # 1. Direct catalog check
+    if install_name.lower() in KNOWN_APPS_CATALOG:
+        cat = KNOWN_APPS_CATALOG[install_name.lower()]
+        return cat["folder"], cat.get("zip"), cat.get("files", [])
+
+    repo_apps = fetch_repo_tree()
+
+    clean_q = install_name.lower().replace("-", "").replace("_", "")
+
+    # 2. Check exact matches
+    for folder, data in repo_apps.items():
+        if folder.lower() == install_name.lower():
+            return folder, data.get("zip"), data.get("files", [])
+
+    # 3. Check normalized substring or abbreviation matching
+    # e.g., 'gemswarm' matches 'Gemini-Cursor-Swarm'
+    for folder, data in repo_apps.items():
+        clean_f = folder.lower().replace("-", "").replace("_", "")
+        # Substring match
+        if clean_q in clean_f or clean_f in clean_q:
+            return folder, data.get("zip"), data.get("files", [])
+        # Compound prefix + suffix match (e.g. gem + swarm in geminicursorswarm)
+        if len(clean_q) >= 6:
+            prefix = clean_q[:3]
+            suffix = clean_q[-4:]
+            if prefix in clean_f and suffix in clean_f:
+                return folder, data.get("zip"), data.get("files", [])
+
+    # 4. Check zip filename matches directly
+    for folder, data in repo_apps.items():
+        zip_path = data.get("zip")
+        if zip_path:
+            clean_z = Path(zip_path).stem.lower().replace("-", "").replace("_", "")
+            if clean_q in clean_z:
+                return folder, zip_path, data.get("files", [])
+
+    return None, None, []
+
 def verify_official_key(app_id: str, local_key: str | None = None, key_link: str | None = None) -> tuple[bool, str]:
     """
     Checks the key against the official key on:
@@ -103,7 +227,6 @@ def verify_official_key(app_id: str, local_key: str | None = None, key_link: str
     if not validate_app_id(app_id):
         return False, "Invalid app-id format: '" + str(app_id) + "'. Must be strictly 4 characters [a-z0-9]."
     
-    # 1. Resolve key candidate from local file or link
     candidate_key = ""
     if local_key and str(local_key).strip():
         candidate_key = str(local_key).strip()
@@ -117,7 +240,6 @@ def verify_official_key(app_id: str, local_key: str | None = None, key_link: str
     else:
         return False, "No 'app-officialkey' or 'app-officialkey-link' specified in info.app.json."
 
-    # 2. Query official remote key
     official_url = OFFICIAL_KEYS_BASE + "/" + app_id + ".key"
     print("[*] Verifying key against official repository: " + official_url)
     ok, official_key = fetch_url_text(official_url)
@@ -134,7 +256,6 @@ def verify_official_key(app_id: str, local_key: str | None = None, key_link: str
 def create_windows_shortcut(target_exe: str, args: str, shortcut_path: str, icon_path: str = "", description: str = "") -> bool:
     """
     Creates a native Windows .lnk shortcut with custom icon using PowerShell.
-    This gives the application its visual icon on Desktop / Start Menu.
     """
     try:
         escaped_target = target_exe.replace("'", "''")
@@ -164,12 +285,7 @@ def create_windows_shortcut(target_exe: str, args: str, shortcut_path: str, icon
 def generate_silent_runner(app_dir: Path, app_name: str, entry_file: str) -> Path:
     """
     Creates a smart launcher script (launcher.pyw).
-    
-    How this satisfies the user's specification:
-    1. Uses pythonw.exe so Windows hides the command prompt window completely by default.
-    2. Runs the target run.py file.
-    3. If run.py produces text output or an error occurs, it displays the output,
-       so text output is NEVER lost!
+    Suppresses the console completely UNLESS the script prints text to stdout/stderr.
     """
     launcher_file = app_dir / "launcher.pyw"
     template = '''# -*- coding: utf-8 -*-
@@ -252,6 +368,7 @@ if __name__ == "__main__":
 def install_app(install_name: str, force: bool = False):
     """
     Main installation logic for `pyapp install <APP_INSTALL_NAME>`.
+    Downloads .zip package, extracts files, verifies key, and generates silent launcher.
     """
     # Validate install name (6-10 letters)
     if not validate_install_name(install_name):
@@ -263,59 +380,93 @@ def install_app(install_name: str, force: bool = False):
     print(" PYapps Installer - Fetching '" + install_name + "'")
     print("============================================================")
 
-    # Remote URL for app's info.app.json
-    manifest_url = REPO_RAW_BASE + "/apps/" + install_name + "/info.app.json"
-    print("[*] Downloading application manifest: " + manifest_url)
-    
-    ok, manifest_content = fetch_url_text(manifest_url)
-    if not ok:
-        manifest_url_io = GITHUB_IO_BASE + "/apps/" + install_name + "/info.app.json"
-        ok, manifest_content = fetch_url_text(manifest_url_io)
-    
-    if not ok:
-        print("[!] Error: Could not find application '" + install_name + "'.")
-        print("    Check that '" + install_name + "' exists in PYapps-INSTALL-SOURCE/apps/" + install_name + "/info.app.json")
+    # Resolve app folder and .zip package path
+    print("[*] Resolving package for install name '" + install_name + "'...")
+    matched_folder, zip_rel_path, loose_files = resolve_app_package(install_name)
+
+    if not matched_folder:
+        print("[!] Error: Could not find application with install-name '" + install_name + "'.")
+        print("    Searched repository apps directory at https://github.com/CB-1829/PYapps-INSTALL-SOURCE")
         sys.exit(1)
 
-    try:
-        manifest = json.loads(manifest_content)
-    except Exception as e:
-        print("[!] Error: Failed to parse info.app.json: " + str(e))
-        sys.exit(1)
+    print("[+] Found repository application: " + matched_folder)
 
-    # Extract schema fields
+    # Destination folder:
+    # C:\Users\<USER>\AppData\Local\Programs\Python\Python314\pyappsinstall\apps\<install_name>
+    apps_root = get_apps_root_dir()
+    app_dest = apps_root / install_name
+    app_dest.mkdir(parents=True, exist_ok=True)
+    print("[*] Target installation folder: " + str(app_dest))
+
+    # Case A: Download and extract .zip archive
+    if zip_rel_path:
+        zip_url = REPO_RAW_BASE + "/" + zip_rel_path
+        print("[*] Downloading package archive: " + zip_url)
+        ok, zip_bytes = fetch_url_bytes(zip_url)
+        if not ok or len(zip_bytes) == 0:
+            print("[!] Error: Failed to download archive: " + zip_url)
+            sys.exit(1)
+
+        print("[*] Extracting .zip archive into " + str(app_dest) + "...")
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                zf.extractall(app_dest)
+            print("[+] Successfully extracted all package files!")
+        except Exception as e:
+            print("[!] Error: Failed to extract .zip archive: " + str(e))
+            sys.exit(1)
+
+    # Case B: Download loose files if no .zip archive
+    else:
+        print("[*] Downloading application files...")
+        files_to_download = loose_files if loose_files else ["app.py", "run.py", "info.app.json"]
+        for fname in files_to_download:
+            file_url = REPO_RAW_BASE + "/apps/" + matched_folder + "/" + fname
+            print("[*] Downloading " + fname + "...")
+            ok, data = fetch_url_bytes(file_url)
+            if ok and len(data) > 0:
+                (app_dest / fname).write_bytes(data)
+
+    # Inspect info.app.json from extracted files
+    manifest_path = app_dest / "info.app.json"
+    manifest: dict = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print("[!] Warning: Could not parse info.app.json: " + str(e))
+
     app_meta = manifest.get("app", {})
-    app_name = app_meta.get("app-name") or manifest.get("app-name", install_name)
+    app_name = app_meta.get("app-name") or manifest.get("app-name", matched_folder)
     app_id = app_meta.get("app-id") or manifest.get("app-id")
     app_key = app_meta.get("app-officialkey") or manifest.get("app-officialkey")
     app_key_link = app_meta.get("app-officialkey-link") or manifest.get("app-officialkey-link")
-    app_icon = app_meta.get("app-icon") or manifest.get("app-icon", "")
-    install_version = manifest.get("app-install-version", "1.0.0")
-    install_spec = manifest.get("app-install", {})
+    app_icon = app_meta.get("app-icon") or manifest.get("app-icon", "app_icon.ico")
 
     print("\n[i] App Name:    " + str(app_name))
     print("[i] App ID:      " + str(app_id))
-    print("[i] Version:     " + str(install_version))
+    print("[i] Install Name:" + str(install_name))
 
-    # Validate 4-digit ID
-    if not app_id or not validate_app_id(app_id):
-        print("\n[!] Error: 'app-id' is required to be a 4-digit ID using a-z and 0-9.")
-        print("    Provided: '" + str(app_id) + "'")
-        sys.exit(1)
-
-    # Perform Official Key Verification
+    # Official Key Verification
     print("\n[*] Performing Official Key Verification...")
-    verified, verify_msg = verify_official_key(app_id, app_key, app_key_link)
+    verified = False
+    verify_msg = ""
+    
+    if app_id and validate_app_id(str(app_id)):
+        verified, verify_msg = verify_official_key(str(app_id), app_key, app_key_link)
+    else:
+        verified = False
+        verify_msg = "app-id ('" + str(app_id) + "') is not a verified 4-digit ID."
 
     if verified:
         print("[✓] " + verify_msg)
         print("[✓] Package is authentic and verified with the PYapps repository.")
     else:
         print("\n" + "!" * 60)
-        print(" [!] SECURITY WARNING: OFFICIAL KEY VERIFICATION FAILED!")
+        print(" [!] SECURITY WARNING: OFFICIAL KEY VERIFICATION FAILED / UNVERIFIED!")
         print(" Reason: " + str(verify_msg))
         print(" Without a matching official key in:")
-        print(" " + OFFICIAL_KEYS_BASE + "/" + app_id + ".key")
+        print(" " + OFFICIAL_KEYS_BASE + "/" + str(app_id) + ".key")
         print(" this application is UNVERIFIED and could be modified or untrusted.")
         print("!" * 60)
         
@@ -330,41 +481,23 @@ def install_app(install_name: str, force: bool = False):
         else:
             print("[!] Force flag specified: continuing installation despite warning.")
 
-    apps_root = get_apps_root_dir()
-    app_dest = apps_root / install_name
-    app_dest.mkdir(parents=True, exist_ok=True)
-    print("\n[*] Installing files to: " + str(app_dest))
+    # Check for requirements.txt and install dependencies
+    req_file = app_dest / "requirements.txt"
+    if req_file.exists():
+        print("\n[*] Found requirements.txt, checking dependencies...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req_file), "--quiet"], check=False)
+            print("[+] Dependencies checked successfully.")
+        except Exception:
+            pass
 
-    # Save info.app.json locally
-    (app_dest / "info.app.json").write_text(manifest_content, encoding="utf-8")
-
-    # Fetch required files (run.py, app.py, icon, etc.)
-    files_to_download = install_spec.get("files", ["run.py", "app.py"])
-    if "run.py" not in files_to_download:
-        files_to_download.append("run.py")
-    if app_icon and app_icon not in files_to_download:
-        files_to_download.append(app_icon)
-
-    for fname in files_to_download:
-        file_url = REPO_RAW_BASE + "/apps/" + install_name + "/" + fname
-        target_path = app_dest / fname
-        print("[*] Downloading " + fname + "...")
-        ok, data = fetch_url_bytes(file_url)
-        if ok and len(data) > 0:
-            target_path.write_bytes(data)
-        else:
-            try:
-                sample_local = Path(__file__).resolve().parent.parent / "apps" / install_name / fname
-                if sample_local.exists():
-                    shutil.copyfile(sample_local, target_path)
-                    print("[+] Loaded local fallback for " + fname)
-                else:
-                    print("[!] Warning: Could not download " + fname + " from " + file_url)
-            except Exception:
-                print("[!] Warning: Could not download " + fname + " from " + file_url)
+    # Determine entry point (run.py or app.py)
+    entry_file = "run.py"
+    if not (app_dest / "run.py").exists():
+        if (app_dest / "app.py").exists():
+            entry_file = "app.py"
 
     # Generate the smart silent launcher (hides console window unless printing text)
-    entry_file = install_spec.get("entry", "run.py")
     launcher_file = generate_silent_runner(app_dest, app_name, entry_file)
     print("[+] Generated silent launcher: " + launcher_file.name)
 
@@ -469,6 +602,7 @@ def setup_installer_cli():
 
     print("\n[✓] Setup complete!")
     print("You can now install applications by running:")
+    print("    pyapp install gemswarm")
     print("    pyapp install testapp")
     print("=" * 60)
 
@@ -527,7 +661,7 @@ PYapps Package Manager & Installer
 Repository: https://cb-1829.github.io/PYapps-INSTALL-SOURCE/
 
 Commands:
-  pyapp install <NAME>      Install app (validates 4-char ID & official key)
+  pyapp install <NAME>      Install app by install-name (extracts .zip archive)
   pyapp install <NAME> -f   Force install even if official key is missing/unverified
   pyapp list                List installed apps
   pyapp run <NAME>          Launch an installed app
@@ -537,7 +671,6 @@ Commands:
 """)
 
 def main():
-    # If run with no arguments or piped via curl | py
     if len(sys.argv) == 1:
         setup_installer_cli()
         return
@@ -546,7 +679,7 @@ def main():
 
     if cmd == "install":
         if len(sys.argv) < 3:
-            print("Error: Missing app install name. Example: pyapp install testapp")
+            print("Error: Missing app install name. Example: pyapp install gemswarm")
             sys.exit(1)
         install_name = sys.argv[2]
         force_flag = ("-f" in sys.argv or "--force" in sys.argv)
@@ -560,13 +693,13 @@ def main():
 
     elif cmd == "run":
         if len(sys.argv) < 3:
-            print("Error: Missing app install name. Example: pyapp run testapp")
+            print("Error: Missing app install name. Example: pyapp run gemswarm")
             sys.exit(1)
         run_app_cli(sys.argv[2])
 
     elif cmd == "verify":
         if len(sys.argv) < 3:
-            print("Error: Missing app-id or install-name. Example: pyapp verify testapp")
+            print("Error: Missing app-id or install-name. Example: pyapp verify a1a1")
             sys.exit(1)
         target = sys.argv[2]
         if validate_app_id(target):
